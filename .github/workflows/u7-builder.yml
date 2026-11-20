@@ -1,0 +1,115 @@
+name: U7 tagged builder probe
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    env:
+      GIT_TERMINAL_PROMPT: '0'
+      GIT_CONFIG_NOSYSTEM: '1'
+      GIT_CONFIG_GLOBAL: /dev/null
+      U7_TAG: v2026.11.20.1
+      U7_OBJECT: d4ed744dd96e4a0629e789b6b2a6c49527505c80
+      U7_COMMIT: 55e4f71011c8f74b3e91f46c4c4f6c6a3f491b10
+      U7_BASELINE_SHA256: 93cee004d146e2e4ca89f114ddef03bb457fe915a9f460cab17218622bc1fd88
+    steps:
+      - name: Clone and check annotated tag
+        shell: bash
+        run: |
+          start=$SECONDS
+          git -c credential.helper= clone --quiet --branch "$U7_TAG" \
+            https://github.com/sakuraiyuta/kaoiro.git source
+          cd source
+          test "$(git rev-parse --is-shallow-repository)" = false
+          test "$(git cat-file -t "refs/tags/$U7_TAG")" = tag
+          test "$(git rev-parse "refs/tags/$U7_TAG")" = "$U7_OBJECT"
+          test "$(git rev-parse "refs/tags/$U7_TAG^{commit}")" = "$U7_COMMIT"
+          test "$(git rev-parse HEAD)" = "$U7_COMMIT"
+          test -z "$(git status --porcelain)"
+          printf 'source tag=%s object=%s peeled_commit=%s elapsed_s=%s\n' \
+            "$U7_TAG" "$U7_OBJECT" "$U7_COMMIT" "$((SECONDS - start))"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+        with:
+          package_json_file: source/package.json
+
+      - name: Build and check Linux x64 and Darwin arm64
+        working-directory: source
+        shell: bash
+        run: |
+          total_start=$SECONDS
+          printf 'tools node=%s pnpm=%s\n' "$(node --version)" "$(pnpm --version)"
+          install_start=$SECONDS
+          install_status=0
+          pnpm install --frozen-lockfile --reporter=silent \
+            > "$RUNNER_TEMP/deps.log" 2>&1 || install_status=$?
+          printf 'install exit=%s elapsed_s=%s\n' \
+            "$install_status" "$((SECONDS - install_start))"
+          test "$install_status" = 0
+
+          build_failed=0
+          for target in linux-x64 darwin-arm64; do
+            out="$RUNNER_TEMP/u7-$target"
+            mkdir "$out"
+            start=$SECONDS
+            status=0
+            scripts/build-runner-tarball.sh --require-tagged \
+              --target "$target" --out "$out" > "$out/builder.log" 2>&1 \
+              || status=$?
+            printf 'build target=%s exit=%s elapsed_s=%s\n' \
+              "$target" "$status" "$((SECONDS - start))"
+            if [[ "$status" != 0 ]]; then
+              grep -E '^build-runner-tarball: (target|building|rev|fetching|staging|archiving|done)' \
+                "$out/builder.log" | tail -n 1 || true
+              build_failed=1
+              continue
+            fi
+            test -z "$(git status --porcelain)"
+            base="kaoiro-runner-$U7_COMMIT-$target"
+            archive="$out/$base.tar.gz"
+            test -f "$archive"
+            tar -xzf "$archive" -C "$out"
+            tree="$out/$base"
+            node runner/deploy/verify-release.mjs "$tree" --require-manifest --hash \
+              > "$out/verify.log" 2>&1
+            jq -ce --arg sha "$U7_COMMIT" --arg version "${U7_TAG#v}" \
+              'select(.revision == $sha and .version == $version and .dirty == false) |
+               {revision,version,dirty,built_at}' "$tree/dist/build-info.json"
+            archive_hash=$(sha256sum "$archive" | cut -d ' ' -f 1)
+            manifest_hash=$(sha256sum "$tree/MANIFEST.json" | cut -d ' ' -f 1)
+            printf 'archive target=%s name=%s bytes=%s sha256=%s manifest_sha256=%s\n' \
+              "$target" "$base.tar.gz" "$(stat -c %s "$archive")" \
+              "$archive_hash" "$manifest_hash"
+            if [[ "$target" == linux-x64 ]]; then
+              match=false
+              [[ "$archive_hash" != "$U7_BASELINE_SHA256" ]] || match=true
+              printf 'comparison linux_x64_baseline_sha256=%s match=%s\n' \
+                "$U7_BASELINE_SHA256" "$match"
+            fi
+          done
+
+          control_start=$SECONDS
+          parent=$(git rev-parse "$U7_COMMIT^")
+          test -z "$(git tag --points-at "$parent")"
+          git -c advice.detachedHead=false checkout --quiet --detach "$parent"
+          control_out="$RUNNER_TEMP/u7-untagged"
+          mkdir "$control_out"
+          status=0
+          scripts/build-runner-tarball.sh --require-tagged --target linux-x64 \
+            --out "$control_out" > "$control_out/builder.log" 2>&1 || status=$?
+          test "$status" != 0
+          grep -oF 'production requires a completed exact landing tag/claim or release tag before building' \
+            "$control_out/builder.log"
+          test -z "$(find "$control_out" -maxdepth 1 -name '*.tar.gz' -print)"
+          printf 'negative untagged_commit=%s exit=%s elapsed_s=%s\n' \
+            "$parent" "$status" "$((SECONDS - control_start))"
+          printf 'total elapsed_s=%s\n' "$((SECONDS - total_start))"
+          exit "$build_failed"
