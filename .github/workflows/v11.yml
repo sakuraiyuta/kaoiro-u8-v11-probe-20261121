@@ -1,0 +1,160 @@
+name: V11 release fixture
+run-name: V11 ${{ inputs.scenario }}
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        required: true
+        type: choice
+        options: [positive, missing-asset, bad-checksum, partial, recovery,
+                  read-token, missing-tag]
+
+permissions:
+  contents: read
+
+env:
+  SCENARIO: ${{ inputs.scenario }}
+  GH_REPO: ${{ github.repository }}
+
+concurrency:
+  group: v11-${{ inputs.scenario }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    outputs:
+      tag: ${{ steps.fixture.outputs.tag }}
+      object: ${{ steps.fixture.outputs.object }}
+    steps:
+      - id: fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          case "$SCENARIO" in
+            positive) suffix=1 ;;
+            missing-asset) suffix=2 ;;
+            bad-checksum) suffix=3 ;;
+            partial|recovery) suffix=4 ;;
+            read-token) suffix=5 ;;
+            missing-tag) suffix=9 ;;
+            *) exit 64 ;;
+          esac
+          tag="v2099.11.21.$suffix"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          if [[ "$SCENARIO" == missing-tag ]]; then
+            exit 0
+          fi
+          tag_ref=$(gh api "repos/$GH_REPO/git/ref/tags/$tag")
+          object=$(jq -er 'select(.object.type == "tag") | .object.sha' \
+            <<< "$tag_ref")
+          commit=$(gh api "repos/$GH_REPO/git/tags/$object" \
+            --jq 'select(.object.type == "commit") | .object.sha')
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          printf 'tag=%s object=%s commit=%s\n' "$tag" "$object" "$commit"
+          echo "object=$object" >> "$GITHUB_OUTPUT"
+
+          if [[ "$SCENARIO" == read-token ]]; then
+            if result=$(gh release create "$tag" --verify-tag --draft \
+              --title 'V11 fixture' --notes 'Test data only.' 2>&1); then
+              echo 'Read token unexpectedly created a draft.'
+              exit 1
+            fi
+            [[ "$result" == *"HTTP 403"* ]]
+            echo 'Draft creation returned HTTP 403.'
+            exit 0
+          fi
+
+          mkdir files
+          for target in linux-x64 darwin-arm64; do
+            name="kaoiro-runner-$tag-$target.tar.gz"
+            printf 'Disposable release test data for %s\n' "$target" > data.txt
+            tar -czf "files/$name" data.txt
+            ( cd files && sha256sum "$name" > "$name.sha256" )
+          done
+          if [[ "$SCENARIO" == bad-checksum ]]; then
+            printf '%s\n' 'Alternate test data.' > data.txt
+            tar -czf "files/kaoiro-runner-$tag-linux-x64.tar.gz" data.txt
+          fi
+          if [[ "$SCENARIO" == missing-asset ]]; then
+            rm -- "files/kaoiro-runner-$tag-linux-x64.tar.gz"
+          fi
+      - if: inputs.scenario != 'read-token' && inputs.scenario != 'missing-tag'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fixture
+          path: files/
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    if: inputs.scenario != 'read-token'
+    needs: build
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - if: inputs.scenario != 'missing-tag'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: fixture
+          path: files/
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+          TAG_OBJECT: ${{ needs.build.outputs.object }}
+        shell: bash
+        run: |
+          create_draft() {
+            local existing
+            existing=$(gh release list --limit 20 --json tagName \
+              --jq "map(select(.tagName == \"$TAG\")) | length") || return 1
+            if [[ "$existing" != 0 ]]; then
+              echo 'Same-tag release or draft already exists.'
+              return 23
+            fi
+            gh release create "$TAG" --verify-tag --draft --latest=false \
+              --title 'V11 fixture' --notes 'Disposable test data only.'
+          }
+
+          if [[ "$SCENARIO" == missing-tag ]]; then
+            if result=$(create_draft 2>&1); then
+              echo 'A draft for a missing tag was unexpectedly created.'
+              exit 1
+            fi
+            [[ "$result" == *"tag"* && "$result" == *"exist"* ]]
+            echo 'Draft creation refused the absent tag.'
+            exit 0
+          fi
+          current=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '.object.sha')
+          [[ "$current" == "$TAG_OBJECT" ]]
+          create_draft
+
+          name="kaoiro-runner-$TAG-darwin-arm64.tar.gz"
+          if [[ "$SCENARIO" == partial ]]; then
+            gh release upload "$TAG" "files/$name"
+            status=0
+            create_draft || status=$?
+            [[ "$status" == 23 ]]
+            echo 'Injected interruption after one upload. Draft retained.'
+            exit 42
+          fi
+
+          gh release upload "$TAG" files/*
+          for file in files/*; do basename "$file"; done | sort > expected
+          gh release view "$TAG" --json assets --jq '.assets[].name' |
+            sort | diff - expected
+          code=$(curl --disable --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' --max-time 20 \
+            --output /dev/null --write-out '%{http_code}' \
+            "https://github.com/$GH_REPO/releases/download/$TAG/$name")
+          echo "Anonymous draft asset HTTP status: $code"
+          [[ "$code" == 404 ]]
+          gh release edit "$TAG" --draft=false --latest=false
+          current=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '.object.sha')
+          [[ "$current" == "$TAG_OBJECT" ]]
+          status=0
+          create_draft || status=$?
+          [[ "$status" == 23 ]]
