@@ -78,8 +78,25 @@ jobs:
             test -f "$archive"
             tar -xzf "$archive" -C "$out"
             tree="$out/$base"
-            node runner/deploy/verify-release.mjs "$tree" --require-manifest --hash \
-              > "$out/verify.log" 2>&1
+            if [[ "$target" == darwin-arm64 ]]; then
+              host_status=0
+              node runner/deploy/verify-release.mjs "$tree" \
+                --require-manifest --hash > "$out/host-verify.log" 2>&1 \
+                || host_status=$?
+              test "$host_status" = 70
+              grep -oF 'Expected one native entry in MANIFEST.json under node_modules/@img/sharp-linux-x64/lib/' \
+                "$out/host-verify.log"
+              printf 'negative host_default_on_darwin exit=%s\n' "$host_status"
+            fi
+            verify_status=0
+            node --input-type=module - "$tree" "$target" \
+              > "$out/verify.log" 2>&1 <<'NODE' || verify_status=$?
+          import { verifyRelease } from "./runner/deploy/verify-release.mjs";
+          const [root, target] = process.argv.slice(2);
+          verifyRelease(root, { requireManifest: true, hash: true, target });
+          NODE
+            printf 'verify target=%s exit=%s\n' "$target" "$verify_status"
+            test "$verify_status" = 0
             jq -ce --arg sha "$U7_COMMIT" --arg version "${U7_TAG#v}" \
               'select(.revision == $sha and .version == $version and .dirty == false) |
                {revision,version,dirty,built_at}' "$tree/dist/build-info.json"
